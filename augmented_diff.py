@@ -68,6 +68,7 @@ Action = namedtuple("Action", ["type", "element"])
 actions = {}
 
 osc = ET.parse(sys.argv[2]).getroot()
+print("Warning: Skipping relations because of custom BM code.")
 for block in osc:
     for e in block:
         # ----- Skipping relations part BM -----
