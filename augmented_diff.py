@@ -9,11 +9,11 @@ Usage: augmented_adiff.py OSMX_FILE OSC_FILE
 """
 
 # This script is adapted from https://github.com/bdon/OSMExpress/blob/main/python/examples/augmented_diff.py
-# 
+#
 # Used under the terms of the BSD 2-Clause License, reproduced below
-# 
+#
 # Copyright 2019 Protomaps.
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -68,7 +68,7 @@ Action = namedtuple("Action", ["type", "element"])
 actions = {}
 
 osc = ET.parse(sys.argv[2]).getroot()
-print("Warning: Skipping relations because of custom BM code.")
+eprint("Warning: Skipping relations because of custom BM code.")
 for block in osc:
     for e in block:
         # ----- Skipping relations part BM -----
@@ -469,7 +469,7 @@ with osmx.Transaction(env) as txn:
             eprint("Affected relation {0} is incomplete in db".format(r))
 
     eprint(f"Pass 4: {time.time() - pass_4_start_time:.3f}s")
-    
+
 # 5th pass: add bounding boxes
 pass_5_start_time = time.time()
 
