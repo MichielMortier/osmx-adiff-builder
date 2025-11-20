@@ -70,6 +70,10 @@ actions = {}
 osc = ET.parse(sys.argv[2]).getroot()
 for block in osc:
     for e in block:
+        # ----- Skipping relations part BM -----
+        if e.tag == "relation":
+            continue
+        # ----- Skipping relations part BM -----
         action_key = e.tag + "/" + e.get("id")
         # Always ensure we're updating to the latest version of an object for the diff
         if action_key in actions:
@@ -388,24 +392,27 @@ with osmx.Transaction(env) as txn:
                     # are already connected, you'd probably want to see the road
                     # and waterway in OSMCha
                     node_id = elem[0][0].get("id")
-                    for rel in node_relation.get(node_id):
-                        if "relation/" + str(rel) not in actions:
-                            affected_relations.add(rel)
+                    # ----- Skipping relations part BM -----
+                    # for rel in node_relation.get(node_id):
+                    #     if "relation/" + str(rel) not in actions:
+                    #         affected_relations.add(rel)
                     for way in node_way.get(node_id):
                         if "way/" + str(way) not in actions:
                             affected_ways.add(way)
-                            for rel in way_relation.get(way):
-                                if "relation/" + str(rel) not in actions:
-                                    affected_relations.add(rel)
+                            # ----- Skipping relations part BM -----
+                            # for rel in way_relation.get(way):
+                            #     if "relation/" + str(rel) not in actions:
+                            #         affected_relations.add(rel)
 
             elif elem[0][0].tag == "way":
                 old_way = [nd.get("ref") for nd in elem[0][0] if nd.tag == "nd"]
                 new_way = [nd.get("ref") for nd in elem[1][0] if nd.tag == "nd"]
                 if old_way != new_way:
                     way_id = elem[0][0].get("id")
-                    for rel in way_relation.get(way_id):
-                        if "relation/" + str(rel) not in actions:
-                            affected_relations.add(rel)
+                    # Skipping relations part BM
+                    # for rel in way_relation.get(way_id):
+                    #     if "relation/" + str(rel) not in actions:
+                    #         affected_relations.add(rel)
 
     for w in affected_ways:
         a = ET.SubElement(o, "action")
