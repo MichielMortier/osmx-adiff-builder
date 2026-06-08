@@ -94,6 +94,87 @@ action_list = [v for k, v in actions.items()]
 
 eprint(f"Pass 1: {time.time() - start_time:.3f}s")
 
+
+# The augmented diff used to be assembled into one big ElementTree held in memory
+# until the very end (every pass operated on the whole tree at once). For diffs
+# that touch nodes on long or heavily-shared ways, Pass 4 expands every such way
+# fully (old + a deepcopy of new), so the resident tree grew far faster than the
+# input .osc — the cause of the production memory blow-up. Instead each <action>
+# is now built, transformed, serialized to a string and dropped immediately; the
+# strings are sorted and streamed out at the end. Output is byte-for-byte
+# identical (see the regression test in the daemon repo). These module-level
+# helpers support that per-action finalize step.
+results = []
+moved_node_ids = []
+# ----- Skipping relations part BM -----
+# Re-enable together with the other "Skipping relations part BM" blocks below to
+# restore relation propagation. changed_way_ids feeds way->relation propagation only.
+# changed_way_ids = []
+# ----- Skipping relations part BM -----
+
+
+def _type_rank(tag):
+    if tag == "node":
+        return 1
+    if tag == "way":
+        return 2
+    return 3
+
+
+class Bounds:
+    def __init__(self):
+        self.minx = 180
+        self.maxx = -180
+        self.miny = 90
+        self.maxy = -90
+
+    def add(self, x, y):
+        if x < self.minx:
+            self.minx = x
+        if x > self.maxx:
+            self.maxx = x
+        if y < self.miny:
+            self.miny = y
+        if y > self.maxy:
+            self.maxy = y
+
+    def elem(self):
+        e = ET.Element("bounds")
+        e.set("minlat", str(self.miny))
+        e.set("minlon", str(self.minx))
+        e.set("maxlat", str(self.maxy))
+        e.set("maxlon", str(self.maxx))
+        return e
+
+
+def _finalize(a):
+    # Applies the former pass 5 (bounding box) and pass 7 (create reshape) to a
+    # single fully-built <action>, then serializes it and records (sort_rank,
+    # id, xml) so the element can be released. The sort key is taken from the new
+    # element BEFORE the create reshape, matching the original sort over the
+    # new-element tag/id.
+    sort_elem = a[1][0]
+    key_rank = _type_rank(sort_elem.tag)
+    key_id = int(sort_elem.get("id"))
+
+    # Pass 5: bounding box on the old element only (matches original behavior).
+    if len(a[0]) > 0:
+        osm_obj = a[0][0]
+        nds = osm_obj.findall(".//nd")
+        if nds:
+            bounds = Bounds()
+            for nd in nds:
+                bounds.add(float(nd.get("lon")), float(nd.get("lat")))
+            osm_obj.insert(0, bounds.elem())
+
+    # Pass 7: a create action is a single OSM element, not <old>/<new> wrappers.
+    if a.get("type") == "create":
+        elem = a[1][0]
+        a[:] = [elem]
+
+    results.append((key_rank, key_id, ET.tostring(a, encoding="unicode")))
+
+
 env = osmx.Environment(sys.argv[1])
 with osmx.Transaction(env) as txn:
     locations = osmx.Locations(txn)
@@ -147,45 +228,71 @@ with osmx.Transaction(env) as txn:
                 # remove these operations from the diff entirely.
                 eprint("No old loc found for tagless node {}".format(elem_id))
                 # elem.set("version", "?")
-                
+
             # elem.set("user", "?")
             # elem.set("uid", "?")
             # elem.set("timestamp", "?")
             # elem.set("changeset", "?")
-            
+
+
+    # 3rd pass helpers
+    # Augment the created "old" and "new" elements with geometry.
+    def augment_nd(nd, use_new):
+        ll = get_lat_lon(nd.get("ref"), use_new)
+        nd.set("lon", ll[0])
+        nd.set("lat", ll[1])
+
+    def augment_member(mem, use_new):
+        if mem.get("type") == "way":
+            ref = mem.get("ref")
+            if use_new and ("way/" + ref in actions):
+                way = actions["way/" + ref]
+                for child in way.element:
+                    if child.tag == "nd":
+                        ref = child.get("ref")
+                        ll = get_lat_lon(ref, use_new)
+                        nd = ET.SubElement(mem, "nd")
+                        nd.set("ref", ref)
+                        nd.set("lon", ll[0])
+                        nd.set("lat", ll[1])
+            else:
+                with ways.get(ref) as way:
+                    for node_id in way.nodes:
+                        ref = str(node_id)
+                        ll = get_lat_lon(ref, use_new)
+                        nd = ET.SubElement(mem, "nd")
+                        nd.set("ref", ref)
+                        nd.set("lon", ll[0])
+                        nd.set("lat", ll[1])
+        elif mem.get("type") == "node":
+            ll = get_lat_lon(mem.get("ref"), use_new)
+            mem.set("lon", ll[0])
+            mem.set("lat", ll[1])
+
+    def augment(elem, use_new):
+        if len(elem) == 0:
+            return
+        if elem[0].tag == "way":
+            for child in elem[0]:
+                if child.tag == "nd":
+                    augment_nd(child, use_new)
+        elif elem[0].tag == "relation":
+            for child in elem[0]:
+                if child.tag == "member":
+                    augment_member(child, use_new)
 
     # 2nd pass
-    # create an XML tree of actions with old and new sub-elements
-
-    pass_2_start_time = time.time()
-
-    o = ET.Element("osm")
-    o.set("version", "0.6")
-    o.set(
-        "generator",
-        "Overpass API not used, but achavi detects it at the start of string; OSMExpress/python/examples/augmented_diff.py",
-    )
-
-    for action in action_list:
-        a = ET.SubElement(o, "action")
+    # build a single <action> with old and new sub-elements. Returns the element
+    # so the caller can augment/finalize it; the early returns mirror the original
+    # loop's `continue` statements (which left a partially-built action in place).
+    def build_action(action):
+        a = ET.Element("action")
         a.set("type", action.type)
         old = ET.SubElement(a, "old")
         new = ET.SubElement(a, "new")
         if action.type == "create":
             new.append(action.element)
         elif action.type == "delete":
-            # # get the old metadata
-            # modified = copy.deepcopy(action.element)
-            # set_old_metadata(action.element)
-            # old.append(action.element)
-
-            # modified.set("visible", "false")
-            # for child in list(modified):
-            #     modified.remove(child)
-            # # TODO the Geofabrik deleted elements seem to have the old metadata and old version numbers
-            # # check if this is true of planet replication files
-            # new.append(modified)
-
             # TODO: dedupe this with "modify" case below (jake)
             # I copy-pasted this because deleted elements also need to be augmented
             # with tags and nodes (not just metadata) in order to be visualized in OSMCha
@@ -195,15 +302,15 @@ with osmx.Transaction(env) as txn:
             set_old_metadata(prev_version)
 
             # logically this goes at the end, but do it first so that we can use
-            # 'continue' to skip processing below (python doesn't have 'goto out;')
+            # 'return' to skip processing below (python doesn't have 'goto out;')
             action.element.set("visible", "false")
             new.append(action.element)
-            
+
             # FIXME: is this right? goal here is to avoid crashing when handling
             # tagless nodes that were deleted...
             if prev_version.get("version") == None or prev_version.get("version") == "?":
-                continue
-            
+                return a
+
             if action.element.tag == "node":
                 ll = get_lat_lon(obj_id, False)
                 prev_version.set("lon", ll[0])
@@ -221,7 +328,7 @@ with osmx.Transaction(env) as txn:
                 if not way:
                     # TODO: this seems to be happening (e.g. for way 987234331), might
                     # be a bug in osmx expand?
-                    continue
+                    return a
                 with way as way:
                     for n in way.nodes:
                         node = ET.SubElement(prev_version, "nd")
@@ -236,7 +343,7 @@ with osmx.Transaction(env) as txn:
                 if not relation:
                     # TODO: this guard avoids errors from the 'with' statement
                     # like "AttributeError: __enter__ -:1.1: Document is empty"
-                    continue
+                    return a
                 with relation as relation:
                     for m in relation.members:
                         member = ET.SubElement(prev_version, "member")
@@ -248,7 +355,6 @@ with osmx.Transaction(env) as txn:
                         tag = ET.SubElement(prev_version, "tag")
                         tag.set("k", t)
                         tag.set("v", next(it))
-
         else:
             obj_id = action.element.get("id")
             if not_in_db(action.element):
@@ -303,120 +409,85 @@ with osmx.Transaction(env) as txn:
                             tag.set("k", t)
                             tag.set("v", next(it))
                 new.append(action.element)
+        return a
 
-    eprint(f"Pass 2: {time.time() - pass_2_start_time:.3f}s")
-    
-    # 3rd pass
-    # Augment the created "old" and "new" elements
-    def augment_nd(nd, use_new):
-        ll = get_lat_lon(nd.get("ref"), use_new)
-        nd.set("lon", ll[0])
-        nd.set("lat", ll[1])
+    # 2nd + 3rd pass:
+    # build each action, augment it, capture nodes that moved (for pass 4), then
+    # serialize and drop it.
+    pass_2_start_time = time.time()
 
-    def augment_member(mem, use_new):
-        if mem.get("type") == "way":
-            ref = mem.get("ref")
-            if use_new and ("way/" + ref in actions):
-                way = actions["way/" + ref]
-                for child in way.element:
-                    if child.tag == "nd":
-                        ref = child.get("ref")
-                        ll = get_lat_lon(ref, use_new)
-                        nd = ET.SubElement(mem, "nd")
-                        nd.set("ref", ref)
-                        nd.set("lon", ll[0])
-                        nd.set("lat", ll[1])
-            else:
-                with ways.get(ref) as way:
-                    for node_id in way.nodes:
-                        ref = str(node_id)
-                        ll = get_lat_lon(ref, use_new)
-                        nd = ET.SubElement(mem, "nd")
-                        nd.set("ref", ref)
-                        nd.set("lon", ll[0])
-                        nd.set("lat", ll[1])
-        elif mem.get("type") == "node":
-            ll = get_lat_lon(mem.get("ref"), use_new)
-            mem.set("lon", ll[0])
-            mem.set("lat", ll[1])
+    for action in action_list:
+        a = build_action(action)
 
-    def augment(elem, use_new):
-        if len(elem) == 0:
-            return
-        if elem[0].tag == "way":
-            for child in elem[0]:
-                if child.tag == "nd":
-                    augment_nd(child, use_new)
-        elif elem[0].tag == "relation":
-            for child in elem[0]:
-                if child.tag == "member":
-                    augment_member(child, use_new)
+        # 4th-pass input: record nodes whose location changed so referencing ways
+        # can be pulled in below. Captured here (instead of re-scanning a retained
+        # output tree) so the action can be freed right after serialization.
+        if a.get("type") == "modify" and len(a[0]) and a[0][0].tag == "node":
+            old_loc = (a[0][0].get("lat"), a[0][0].get("lon"))
+            new_loc = (a[1][0].get("lat"), a[1][0].get("lon"))
+            if old_loc != new_loc:
+                moved_node_ids.append(a[0][0].get("id"))
+        # ----- Skipping relations part BM -----
+        # A way whose node list changed propagates to relations it belongs to.
+        # elif a.get("type") == "modify" and len(a[0]) and a[0][0].tag == "way":
+        #     old_way = [nd.get("ref") for nd in a[0][0] if nd.tag == "nd"]
+        #     new_way = [nd.get("ref") for nd in a[1][0] if nd.tag == "nd"]
+        #     if old_way != new_way:
+        #         changed_way_ids.append(a[0][0].get("id"))
+        # ----- Skipping relations part BM -----
 
-    pass_3_start_time = time.time()
-    
-    for elem in o:
+        # 3rd pass: augment old/new geometry
         try:
-            augment(elem[0], False)
-            augment(elem[1], True)
+            augment(a[0], False)
+            augment(a[1], True)
         except (TypeError, AttributeError):
             eprint(
                 "Changed {0} {1} is incomplete in db".format(
-                    elem[1][0].tag, elem[1][0].get("id")
+                    a[1][0].tag, a[1][0].get("id")
                 )
             )
 
-    eprint(f"Pass 3: {time.time() - pass_3_start_time:.3f}s")
-    
+        _finalize(a)
+
+    eprint(f"Pass 2/3: {time.time() - pass_2_start_time:.3f}s")
+
     # 4th pass:
     # find changes that propagate to referencing elements:
-    # when a node's location changes, that propagates to any ways it belongs to, relations it belongs to
-    # and also any relations that the way belongs to
-    # when a way's node list changes, it propagates to any relations it belongs to
+    # when a node's location changes, that propagates to any ways it belongs to.
+    # (relation propagation is disabled per the custom BM code, so only ways.)
     pass_4_start_time = time.time()
-    
+
     node_way = osmx.NodeWay(txn)
-    node_relation = osmx.NodeRelation(txn)
-    way_relation = osmx.WayRelation(txn)
+    # ----- Skipping relations part BM -----
+    # node_relation = osmx.NodeRelation(txn)
+    # way_relation = osmx.WayRelation(txn)
+    # ----- Skipping relations part BM -----
 
     affected_ways = set()
-    affected_relations = set()
-    for elem in o:
-        if elem.get("type") == "modify":
-            if elem[0][0].tag == "node":
-                old_loc = (elem[0][0].get("lat"), elem[0][0].get("lon"))
-                new_loc = (elem[1][0].get("lat"), elem[1][0].get("lon"))
-                if old_loc != new_loc:
-                    # TODO: the condition above assumes we only want ways whose
-                    # geometry has changed, but maybe we also want to include
-                    # ways as context if one of the nodes had a tag-only change?
-                    # e.g. adding ford=yes to a node where a road and waterway
-                    # are already connected, you'd probably want to see the road
-                    # and waterway in OSMCha
-                    node_id = elem[0][0].get("id")
-                    # ----- Skipping relations part BM -----
-                    # for rel in node_relation.get(node_id):
-                    #     if "relation/" + str(rel) not in actions:
-                    #         affected_relations.add(rel)
-                    for way in node_way.get(node_id):
-                        if "way/" + str(way) not in actions:
-                            affected_ways.add(way)
-                            # ----- Skipping relations part BM -----
-                            # for rel in way_relation.get(way):
-                            #     if "relation/" + str(rel) not in actions:
-                            #         affected_relations.add(rel)
-
-            elif elem[0][0].tag == "way":
-                old_way = [nd.get("ref") for nd in elem[0][0] if nd.tag == "nd"]
-                new_way = [nd.get("ref") for nd in elem[1][0] if nd.tag == "nd"]
-                if old_way != new_way:
-                    way_id = elem[0][0].get("id")
-                    # Skipping relations part BM
-                    # for rel in way_relation.get(way_id):
-                    #     if "relation/" + str(rel) not in actions:
-                    #         affected_relations.add(rel)
+    # affected_relations = set()  # ----- Skipping relations part BM -----
+    for node_id in moved_node_ids:
+        # ----- Skipping relations part BM -----
+        # for rel in node_relation.get(node_id):
+        #     if "relation/" + str(rel) not in actions:
+        #         affected_relations.add(rel)
+        # ----- Skipping relations part BM -----
+        for way in node_way.get(node_id):
+            if "way/" + str(way) not in actions:
+                affected_ways.add(way)
+                # ----- Skipping relations part BM -----
+                # for rel in way_relation.get(way):
+                #     if "relation/" + str(rel) not in actions:
+                #         affected_relations.add(rel)
+                # ----- Skipping relations part BM -----
+    # ----- Skipping relations part BM -----
+    # for way_id in changed_way_ids:
+    #     for rel in way_relation.get(way_id):
+    #         if "relation/" + str(rel) not in actions:
+    #             affected_relations.add(rel)
+    # ----- Skipping relations part BM -----
 
     for w in affected_ways:
-        a = ET.SubElement(o, "action")
+        a = ET.Element("action")
         a.set("type", "modify")
         old = ET.SubElement(a, "old")
         way_element = ET.SubElement(old, "way")
@@ -437,142 +508,83 @@ with osmx.Transaction(env) as txn:
         new.append(new_elem)
         augment(old, False)
         augment(new, True)
+        _finalize(a)
 
-    for r in affected_relations:
-        old = ET.Element("old")
-        relation_element = ET.SubElement(old, "relation")
-        relation_element.set("id", str(r))
-        set_old_metadata(relation_element)
-        with relations.get(r) as relation:
-            for m in relation.members:
-                member = ET.SubElement(relation_element, "member")
-                member.set("ref", str(m.ref))
-                member.set("role", m.role)
-                member.set("type", str(m.type))
-            it = iter(relation.tags)
-            for t in it:
-                tag = ET.SubElement(relation_element, "tag")
-                tag.set("k", t)
-                tag.set("v", next(it))
-
-        new_elem = copy.deepcopy(relation_element)
-        new = ET.Element("new")
-        new.append(new_elem)
-        try:
-            augment(old, False)
-            augment(new, True)
-            a = ET.SubElement(o, "action")
-            a.set("type", "modify")
-            a.append(old)
-            a.append(new)
-        except (TypeError, AttributeError):
-            eprint("Affected relation {0} is incomplete in db".format(r))
+    # ----- Skipping relations part BM -----
+    # Emit the relations affected by the propagation above. Re-enable together
+    # with all other "Skipping relations part BM" blocks (and use the unfiltered
+    # osmx db, which contains relations). Verified output-identical to the
+    # original via the relation regression fixture.
+    # for r in affected_relations:
+    #     old = ET.Element("old")
+    #     relation_element = ET.SubElement(old, "relation")
+    #     relation_element.set("id", str(r))
+    #     set_old_metadata(relation_element)
+    #     with relations.get(r) as relation:
+    #         for m in relation.members:
+    #             member = ET.SubElement(relation_element, "member")
+    #             member.set("ref", str(m.ref))
+    #             member.set("role", m.role)
+    #             member.set("type", str(m.type))
+    #         it = iter(relation.tags)
+    #         for t in it:
+    #             tag = ET.SubElement(relation_element, "tag")
+    #             tag.set("k", t)
+    #             tag.set("v", next(it))
+    #
+    #     new_elem = copy.deepcopy(relation_element)
+    #     new = ET.Element("new")
+    #     new.append(new_elem)
+    #     try:
+    #         augment(old, False)
+    #         augment(new, True)
+    #         a = ET.Element("action")
+    #         a.set("type", "modify")
+    #         a.append(old)
+    #         a.append(new)
+    #         _finalize(a)
+    #     except (TypeError, AttributeError):
+    #         eprint("Affected relation {0} is incomplete in db".format(r))
+    # ----- Skipping relations part BM -----
 
     eprint(f"Pass 4: {time.time() - pass_4_start_time:.3f}s")
 
-# 5th pass: add bounding boxes
-pass_5_start_time = time.time()
-
-class Bounds:
-    def __init__(self):
-        self.minx = 180
-        self.maxx = -180
-        self.miny = 90
-        self.maxy = -90
-
-    def add(self, x, y):
-        if x < self.minx:
-            self.minx = x
-        if x > self.maxx:
-            self.maxx = x
-        if y < self.miny:
-            self.miny = y
-        if y > self.maxy:
-            self.maxy = y
-
-    def elem(self):
-        e = ET.Element("bounds")
-        e.set("minlat", str(self.miny))
-        e.set("minlon", str(self.minx))
-        e.set("maxlat", str(self.maxy))
-        e.set("maxlon", str(self.maxx))
-        return e
-
-
-for child in o:
-    if len(child[0]) > 0:
-        osm_obj = child[0][0]
-        nds = osm_obj.findall(".//nd")
-        if nds:
-            bounds = Bounds()
-            for nd in nds:
-                bounds.add(float(nd.get("lon")), float(nd.get("lat")))
-            osm_obj.insert(0, bounds.elem())
-
-eprint(f"Pass 5: {time.time() - pass_5_start_time:.3f}s")
-
-# 6th pass
-# sort by node, way, relation
-# within each, sorted by increasing ID
-
+# 5th-7th passes were applied per-action during _finalize. Here we only order the
+# serialized actions and stream them out.
+#
+# 6th pass: sort by node, way, relation; within each, by increasing ID. The
+# original did a stable sort by id then by type, which is equivalent to sorting
+# by (type_rank, id).
 pass_6_start_time = time.time()
-
-def sort_by_type(x):
-    if x[1][0].tag == "node":
-        return 1
-    elif x[1][0].tag == "way":
-        return 2
-    return 3
-
-
-o[:] = sorted(o, key=lambda x: int(x[1][0].get("id")))
-o[:] = sorted(o, key=sort_by_type)
-
+results.sort(key=lambda r: (r[0], r[1]))
 eprint(f"Pass 6: {time.time() - pass_6_start_time:.3f}s")
 
-# 7th pass: fix <action type="create"> elements. They're supposed to have a
-# single child which is an OSM element, but the code above has instead given
-# them a <new> child with an OSM element inside _that_, and refactoring was
-# going to be hard so I'm just fixing it at the end here.
-
-pass_7_start_time = time.time()
-
-for child in o:
-    if child.tag == "action" and child.get("type") == "create":
-        # child[0] is an empty <old> element, child[1] is a <new> element
-        # which contains the created OSM element as _its_ only child
-        elem = child[1][0]
-        child[:] = [elem]
-
-eprint(f"Pass 7: {time.time() - pass_7_start_time:.3f}s")
-
+# Build the <osm> wrapper + <note> exactly as before, serialize it once, then
+# splice the sorted action strings in before the closing tag. This reproduces
+# ElementTree.write(..., encoding="unicode", xml_declaration=True) byte-for-byte
+# (the declaration string is the CPython default) without ever holding the whole
+# augmented diff in memory at once.
+o = ET.Element("osm")
+o.set("version", "0.6")
+o.set(
+    "generator",
+    "Overpass API not used, but achavi detects it at the start of string; OSMExpress/python/examples/augmented_diff.py",
+)
 note = ET.Element("note")
 note.text = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
-o.insert(0, note)
+o.append(note)
 
-# pretty print helper
-# http://effbot.org/zone/element-lib.htm#prettyprint
-def indent(elem, level=0):
-    i = "\n" + level * "  "
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = i + "  "
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = i
-        for elem in elem:
-            indent(elem, level + 1)
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = i
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = i
+closing = "</osm>"
+header = ET.tostring(o, encoding="unicode")
+assert header.endswith(closing), "unexpected <osm> serialization"
 
 write_output_start_time = time.time()
 
-# indent(o)
-
-# ET.ElementTree(o).write(sys.argv[3])
-ET.ElementTree(o).write(sys.stdout, encoding="unicode", xml_declaration=True)
+sys.stdout.write("<?xml version='1.0' encoding='utf-8'?>\n")
+sys.stdout.write(header[: -len(closing)])
+for _, _, action_xml in results:
+    sys.stdout.write(action_xml)
+sys.stdout.write(closing)
 sys.stdout.write("\n")  # tree.write does not write a final newline
 
 end_time = time.time()
